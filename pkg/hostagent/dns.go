@@ -16,6 +16,20 @@ type Handler struct {
 	clients      []*dns.Client
 }
 
+type Server struct {
+	udp *dns.Server
+	tcp *dns.Server
+}
+
+func (s *Server) Shutdown() {
+	if s.udp != nil {
+		_ = s.udp.Shutdown()
+	}
+	if s.tcp != nil {
+		_ = s.tcp.Shutdown()
+	}
+}
+
 func newStaticClientConfig(ips []net.IP) (*dns.ClientConfig, error) {
 	s := ``
 	for _, ip := range ips {
@@ -64,12 +78,80 @@ func (h *Handler) handleQuery(w dns.ResponseWriter, req *dns.Msg) {
 								Name:   q.Name,
 								Rrtype: dns.TypeA,
 								Class:  dns.ClassINET,
+								Ttl:    5,
 							},
 							A: ip.To4(),
 						}
 						reply.Answer = append(reply.Answer, a)
 						handled = true
-						break
+					}
+				}
+			}
+		case dns.TypeAAAA:
+			addrs, err := net.LookupIP(q.Name)
+			if err == nil && len(addrs) > 0 {
+				for _, ip := range addrs {
+					if ip.To16() != nil {
+						a := &dns.AAAA{
+							Hdr: dns.RR_Header{
+								Name:   q.Name,
+								Rrtype: dns.TypeAAAA,
+								Class:  dns.ClassINET,
+								Ttl:    5,
+							},
+							AAAA: ip.To16(),
+						}
+						reply.Answer = append(reply.Answer, a)
+						handled = true
+					}
+				}
+			}
+		case dns.TypeCNAME:
+			cname, err := net.LookupCNAME(q.Name)
+			if err == nil && cname != "" {
+				a := &dns.CNAME{
+					Hdr: dns.RR_Header{
+						Name:   q.Name,
+						Rrtype: dns.TypeCNAME,
+						Class:  dns.ClassINET,
+						Ttl:    5,
+					},
+					Target: cname,
+				}
+				reply.Answer = append(reply.Answer, a)
+				handled = true
+			}
+		case dns.TypeTXT:
+			txt, err := net.LookupTXT(q.Name)
+			if err == nil && len(txt) > 0 {
+				a := &dns.TXT{
+					Hdr: dns.RR_Header{
+						Name:   q.Name,
+						Rrtype: dns.TypeTXT,
+						Class:  dns.ClassINET,
+						Ttl:    5,
+					},
+					Txt: txt,
+				}
+				reply.Answer = append(reply.Answer, a)
+				handled = true
+			}
+		case dns.TypeNS:
+			ns, err := net.LookupNS(q.Name)
+			if err == nil && len(ns) > 0 {
+				for _, s := range ns {
+					if s.Host != "" {
+						a := &dns.NS{
+							Hdr: dns.RR_Header{
+								Name:   q.Name,
+								Rrtype: dns.TypeNS,
+								Class:  dns.ClassINET,
+								Ttl:    5,
+							},
+							Ns: s.Host,
+						}
+						reply.Answer = append(reply.Answer, a)
+						handled = true
 					}
 				}
 			}
@@ -107,17 +189,31 @@ func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	}
 }
 
-func (a *HostAgent) StartDNS() (*dns.Server, error) {
+func (a *HostAgent) StartDNS() (*Server, error) {
 	h, err := newHandler()
 	if err != nil {
 		panic(err)
 	}
-	addr := fmt.Sprintf("127.0.0.1:%d", a.udpDNSLocalPort)
-	server := &dns.Server{Net: "udp", Addr: addr, Handler: h}
-	go func() {
-		if e := server.ListenAndServe(); e != nil {
-			panic(e)
-		}
-	}()
+	server := &Server{}
+	if a.udpDNSLocalPort > 0 {
+		go func() {
+			addr := fmt.Sprintf("127.0.0.1:%d", a.udpDNSLocalPort)
+			s := &dns.Server{Net: "udp", Addr: addr, Handler: h}
+			server.udp = s
+			if e := s.ListenAndServe(); e != nil {
+				panic(e)
+			}
+		}()
+	}
+	if a.tcpDNSLocalPort > 0 {
+		go func() {
+			addr := fmt.Sprintf("127.0.0.1:%d", a.tcpDNSLocalPort)
+			s := &dns.Server{Net: "tcp", Addr: addr, Handler: h}
+			server.tcp = s
+			if e := s.ListenAndServe(); e != nil {
+				panic(e)
+			}
+		}()
+	}
 	return server, nil
 }

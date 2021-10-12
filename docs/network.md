@@ -20,9 +20,21 @@ The loopback addresses of the host is `192.168.5.2` and is accessible from the g
 
 The DNS.
 
-If `useHostResolver` in `lima.yaml` is true, then the hostagent is going to run a DNS server over udp, using the same socket number as `ssh.localPort`. This server does a local lookup using the native host resolver, so will deal correctly with VPN configurations and split-DNS setups, as well a mDNS (for this the hostagent has to be compiled with `CGO_ENABLED=1`).
+If `useHostResolver` in `lima.yaml` is true, then the hostagent is going to run a DNS server over tcp and udp each on a separate randomly selected free port. This server does a local lookup using the native host resolver, so will deal correctly with VPN configurations and split-DNS setups, as well a mDNS (for this the hostagent has to be compiled with `CGO_ENABLED=1`).
 
-This udp port is then forwarded via iptables rules to `192.168.5.3:53`, overriding the DNS provided by QEMU via slirp.
+These tcp and udp ports are then forwarded via iptables rules to `192.168.5.3:53`, overriding the DNS provided by QEMU via slirp.
+
+Currently following request types are supported:
+
+- A
+- AAAA
+- CNAME
+- TXT
+- NS
+
+For other queries hostagent will return an empty response.
+
+DNS over tcp is rarely used. It is usually only used either when user explicitly requires it, or when request+response can't fit into a single UDP packet (most likely in case of DNSSEC), or a certain management operations such as domain transfer. Neither DNSSEC nor management operations currently supported by a hostagent, but on the off chance the response may contain an unusually long list of records - hostagent will also listen for the tcp traffic.
 
 During initial cloud-init bootstrap, `iptables` may not yet be installed. In that case the repo server is determined using the slirp DNS. After `iptables` has been installed, the forwarding rule is applied, switching over to the hostagent DNS.
 
