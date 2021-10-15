@@ -65,72 +65,59 @@ func (h *Handler) handleQuery(w dns.ResponseWriter, req *dns.Msg) {
 		reply   dns.Msg
 		handled bool
 	)
+	reply.RecursionAvailable = true
 	reply.SetReply(req)
-	for _, q := range reply.Question {
+	for _, q := range req.Question {
+		hdr := dns.RR_Header{
+			Name:   q.Name,
+			Rrtype: q.Qtype,
+			Class:  q.Qclass,
+			Ttl:    5,
+		}
 		switch q.Qtype {
-		case dns.TypeA:
-			addrs, err := net.LookupIP(q.Name)
-			if err == nil && len(addrs) > 0 {
-				for _, ip := range addrs {
-					if ip.To4() != nil {
-						a := &dns.A{
-							Hdr: dns.RR_Header{
-								Name:   q.Name,
-								Rrtype: dns.TypeA,
-								Class:  dns.ClassINET,
-								Ttl:    5,
-							},
-							A: ip.To4(),
-						}
-						reply.Answer = append(reply.Answer, a)
-						handled = true
-					}
-				}
-			}
-		case dns.TypeAAAA:
-			addrs, err := net.LookupIP(q.Name)
-			if err == nil && len(addrs) > 0 {
-				for _, ip := range addrs {
-					if ip.To16() != nil {
-						a := &dns.AAAA{
-							Hdr: dns.RR_Header{
-								Name:   q.Name,
-								Rrtype: dns.TypeAAAA,
-								Class:  dns.ClassINET,
-								Ttl:    5,
-							},
-							AAAA: ip.To16(),
-						}
-						reply.Answer = append(reply.Answer, a)
-						handled = true
-					}
-				}
-			}
-		case dns.TypeCNAME:
+		case dns.TypeCNAME, dns.TypeA, dns.TypeAAAA:
 			cname, err := net.LookupCNAME(q.Name)
 			if err == nil && cname != "" {
+				hdr.Rrtype = dns.TypeCNAME
 				a := &dns.CNAME{
-					Hdr: dns.RR_Header{
-						Name:   q.Name,
-						Rrtype: dns.TypeCNAME,
-						Class:  dns.ClassINET,
-						Ttl:    5,
-					},
+					Hdr:    hdr,
 					Target: cname,
 				}
-				reply.Answer = append(reply.Answer, a)
+				reply.Answer = append([]dns.RR{a}, reply.Answer...)
 				handled = true
+			}
+			if q.Qtype == dns.TypeCNAME || (!req.RecursionDesired && handled) {
+				break
+			}
+			addrs, err := net.LookupIP(q.Name)
+			if err == nil && len(addrs) > 0 {
+				for _, ip := range addrs {
+					var a dns.RR
+					ipv6 := ip.To4() == nil
+					if q.Qtype == dns.TypeA && !ipv6 {
+						hdr.Rrtype = dns.TypeA
+						a = &dns.A{
+							Hdr: hdr,
+							A:   ip.To4(),
+						}
+					} else if q.Qtype == dns.TypeAAAA && ipv6 {
+						hdr.Rrtype = dns.TypeAAAA
+						a = &dns.AAAA{
+							Hdr:  hdr,
+							AAAA: ip.To16(),
+						}
+					} else {
+						continue
+					}
+					reply.Answer = append(reply.Answer, a)
+					handled = true
+				}
 			}
 		case dns.TypeTXT:
 			txt, err := net.LookupTXT(q.Name)
 			if err == nil && len(txt) > 0 {
 				a := &dns.TXT{
-					Hdr: dns.RR_Header{
-						Name:   q.Name,
-						Rrtype: dns.TypeTXT,
-						Class:  dns.ClassINET,
-						Ttl:    5,
-					},
+					Hdr: hdr,
 					Txt: txt,
 				}
 				reply.Answer = append(reply.Answer, a)
@@ -142,13 +129,8 @@ func (h *Handler) handleQuery(w dns.ResponseWriter, req *dns.Msg) {
 				for _, s := range ns {
 					if s.Host != "" {
 						a := &dns.NS{
-							Hdr: dns.RR_Header{
-								Name:   q.Name,
-								Rrtype: dns.TypeNS,
-								Class:  dns.ClassINET,
-								Ttl:    5,
-							},
-							Ns: s.Host,
+							Hdr: hdr,
+							Ns:  s.Host,
 						}
 						reply.Answer = append(reply.Answer, a)
 						handled = true
@@ -159,6 +141,7 @@ func (h *Handler) handleQuery(w dns.ResponseWriter, req *dns.Msg) {
 	}
 	if handled {
 		_ = w.WriteMsg(&reply)
+		_ = w.Close()
 		return
 	}
 	h.handleDefault(w, req)
@@ -171,6 +154,7 @@ func (h *Handler) handleDefault(w dns.ResponseWriter, req *dns.Msg) {
 			reply, _, err := client.Exchange(req, addr)
 			if err == nil {
 				_ = w.WriteMsg(reply)
+				_ = w.Close()
 				return
 			}
 		}
@@ -216,4 +200,14 @@ func (a *HostAgent) StartDNS() (*Server, error) {
 		}()
 	}
 	return server, nil
+}
+
+// FakeDNSServer creates dummy agent pre-configured to run DNS server.
+// For debugging.
+func FakeDNSServer(udp, tcp int) (*Server, error) {
+	a := &HostAgent{
+		udpDNSLocalPort: udp,
+		tcpDNSLocalPort: tcp,
+	}
+	return a.StartDNS()
 }
