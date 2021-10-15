@@ -3,17 +3,21 @@
 package hostagent
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"net"
+	"sort"
 	"strings"
 
+	"github.com/johnstarich/go/dns/scutil"
 	"github.com/miekg/dns"
 	"github.com/sirupsen/logrus"
 )
 
 type Handler struct {
-	clientConfig *dns.ClientConfig
-	clients      []*dns.Client
+	domainClientConfigs  map[string][]*dns.ClientConfig
+	defaultClientConfigs []*dns.ClientConfig
+	clients              []*dns.Client
 }
 
 type Server struct {
@@ -30,147 +34,129 @@ func (s *Server) Shutdown() {
 	}
 }
 
-func newStaticClientConfig(ips []net.IP) (*dns.ClientConfig, error) {
+func newStaticClientConfig(ips []string) (*dns.ClientConfig, error) {
 	s := ``
 	for _, ip := range ips {
-		s += fmt.Sprintf("nameserver %s\n", ip.String())
+		s += fmt.Sprintf("nameserver %s\n", ip)
 	}
 	r := strings.NewReader(s)
 	return dns.ClientConfigFromReader(r)
 }
 
 func newHandler() (dns.Handler, error) {
-	cc, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+	h := &Handler{
+		domainClientConfigs:  map[string][]*dns.ClientConfig{},
+		defaultClientConfigs: []*dns.ClientConfig{},
+		clients: []*dns.Client{
+			{}, // UDP
+			{
+				Net: "tcp",
+			},
+		},
+	}
+
+	scConfig, err := scutil.ReadMacOSDNS(context.TODO())
 	if err != nil {
-		fallbackIPs := []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("1.1.1.1")}
-		logrus.WithError(err).Warnf("failed to detect system DNS, falling back to %v", fallbackIPs)
-		cc, err = newStaticClientConfig(fallbackIPs)
+		logrus.WithError(err).Warn("failed to detect scutils DNS, falling back to /etc/resolv.conf")
+		cc, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+		if err != nil {
+			fallbackIPs := []string{"8.8.8.8", "1.1.1.1"}
+			logrus.WithError(err).Warnf("failed to detect /etc/resolv.conf DNS, falling back to %v", fallbackIPs)
+			cc, err = newStaticClientConfig(fallbackIPs)
+			if err != nil {
+				return nil, err
+			}
+		}
+		h.defaultClientConfigs = []*dns.ClientConfig{cc}
+		return h, nil
+	}
+
+	var resolvers []scutil.Resolver
+	for _, r := range scConfig.Resolvers {
+		if !r.Reachable() {
+			continue
+		}
+		resolvers = append(resolvers, r)
+	}
+	sort.Slice(resolvers, func(i, j int) bool {
+		return (resolvers[i].Domain != "" && resolvers[j].Domain == "") ||
+			resolvers[i].Order < resolvers[j].Order
+	})
+	for _, r := range resolvers {
+		cc, err := newStaticClientConfig(r.Nameservers)
 		if err != nil {
 			return nil, err
 		}
+		if r.Domain == "" {
+			h.defaultClientConfigs = append(h.defaultClientConfigs, cc)
+		} else {
+			if h.domainClientConfigs[r.Domain] == nil {
+				h.domainClientConfigs[r.Domain] = []*dns.ClientConfig{}
+			}
+			h.domainClientConfigs[r.Domain] = append(h.domainClientConfigs[r.Domain], cc)
+		}
 	}
-	clients := []*dns.Client{
-		{}, // UDP
-		{Net: "tcp"},
-	}
-	h := &Handler{
-		clientConfig: cc,
-		clients:      clients,
-	}
+
 	return h, nil
 }
-
-func (h *Handler) handleQuery(w dns.ResponseWriter, req *dns.Msg) {
-	var (
-		reply   dns.Msg
-		handled bool
-	)
-	reply.RecursionAvailable = true
-	reply.SetReply(req)
-	for _, q := range req.Question {
-		hdr := dns.RR_Header{
-			Name:   q.Name,
-			Rrtype: q.Qtype,
-			Class:  q.Qclass,
-			Ttl:    5,
-		}
-		switch q.Qtype {
-		case dns.TypeCNAME, dns.TypeA, dns.TypeAAAA:
-			cname, err := net.LookupCNAME(q.Name)
-			if err == nil && cname != "" {
-				hdr.Rrtype = dns.TypeCNAME
-				a := &dns.CNAME{
-					Hdr:    hdr,
-					Target: cname,
-				}
-				reply.Answer = append([]dns.RR{a}, reply.Answer...)
-				handled = true
+func (h *Handler) tryWithConfig(w dns.ResponseWriter, req *dns.Msg, clientConfig *dns.ClientConfig) error {
+	for _, client := range h.clients {
+		for _, srv := range clientConfig.Servers {
+			addr := fmt.Sprintf("%s:%s", srv, clientConfig.Port)
+			reply, _, err := client.Exchange(req, addr)
+			if err != nil {
+				logrus.WithError(err).Warnf("Failed to query from %s", addr)
+				continue
 			}
-			if q.Qtype == dns.TypeCNAME || (!req.RecursionDesired && handled) {
-				break
-			}
-			addrs, err := net.LookupIP(q.Name)
-			if err == nil && len(addrs) > 0 {
-				for _, ip := range addrs {
-					var a dns.RR
-					ipv6 := ip.To4() == nil
-					if q.Qtype == dns.TypeA && !ipv6 {
-						hdr.Rrtype = dns.TypeA
-						a = &dns.A{
-							Hdr: hdr,
-							A:   ip.To4(),
-						}
-					} else if q.Qtype == dns.TypeAAAA && ipv6 {
-						hdr.Rrtype = dns.TypeAAAA
-						a = &dns.AAAA{
-							Hdr:  hdr,
-							AAAA: ip.To16(),
-						}
-					} else {
-						continue
-					}
-					reply.Answer = append(reply.Answer, a)
-					handled = true
-				}
-			}
-		case dns.TypeTXT:
-			txt, err := net.LookupTXT(q.Name)
-			if err == nil && len(txt) > 0 {
-				a := &dns.TXT{
-					Hdr: hdr,
-					Txt: txt,
-				}
-				reply.Answer = append(reply.Answer, a)
-				handled = true
-			}
-		case dns.TypeNS:
-			ns, err := net.LookupNS(q.Name)
-			if err == nil && len(ns) > 0 {
-				for _, s := range ns {
-					if s.Host != "" {
-						a := &dns.NS{
-							Hdr: hdr,
-							Ns:  s.Host,
-						}
-						reply.Answer = append(reply.Answer, a)
-						handled = true
-					}
-				}
-			}
+			_ = w.WriteMsg(reply)
+			return nil
 		}
 	}
-	if handled {
-		_ = w.WriteMsg(&reply)
-		_ = w.Close()
-		return
-	}
-	h.handleDefault(w, req)
+	return errors.New("No nameservers found")
 }
 
-func (h *Handler) handleDefault(w dns.ResponseWriter, req *dns.Msg) {
-	for _, client := range h.clients {
-		for _, srv := range h.clientConfig.Servers {
-			addr := fmt.Sprintf("%s:%s", srv, h.clientConfig.Port)
-			reply, _, err := client.Exchange(req, addr)
-			if err == nil {
-				_ = w.WriteMsg(reply)
-				_ = w.Close()
+func (h *Handler) matchDomainConfig(w dns.ResponseWriter, req *dns.Msg, q dns.Question) error {
+	for domain, clientConfigs := range h.domainClientConfigs {
+		if strings.HasSuffix(strings.ToLower(q.Name), strings.ToLower(domain)+".") {
+			for _, clientConfig := range clientConfigs {
+				if err := h.tryWithConfig(w, req, clientConfig); err == nil {
+					return nil
+				}
+			}
+		}
+	}
+	return errors.New("No working match found")
+}
+
+func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
+	if req.Opcode == dns.OpcodeQuery || req.Opcode == dns.OpcodeIQuery {
+		for _, q := range req.Question {
+			if err := h.matchDomainConfig(w, req, q); err == nil {
 				return
 			}
 		}
 	}
-	var reply dns.Msg
-	reply.SetReply(req)
-	_ = w.WriteMsg(&reply)
-}
-
-func (h *Handler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
-	switch req.Opcode {
-	case dns.OpcodeQuery:
-		h.handleQuery(w, req)
-	default:
-		h.handleDefault(w, req)
+	for _, clientConfig := range h.defaultClientConfigs {
+		if err := h.tryWithConfig(w, req, clientConfig); err == nil {
+			return
+		}
 	}
+
+	_ = w.WriteMsg(&dns.Msg{
+		MsgHdr: dns.MsgHdr{
+			Id:                 req.Id,
+			Response:           true,
+			Opcode:             req.Opcode,
+			Authoritative:      false,
+			Truncated:          false,
+			RecursionDesired:   false,
+			RecursionAvailable: false,
+			Zero:               false,
+			AuthenticatedData:  false,
+			CheckingDisabled:   false,
+			Rcode:              dns.RcodeServerFailure,
+		},
+	})
 }
 
 func (a *HostAgent) StartDNS() (*Server, error) {
